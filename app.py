@@ -147,8 +147,7 @@ def tts():
         "text_seed":42,
         "refine_max_new_token": 384,
         "infer_max_new_token": 2048,
-        "wav": 0,
-        "is_stream":0
+        "wav": 0
     }
 
     # 获取
@@ -158,7 +157,6 @@ def tts():
     top_p = utils.get_parameter(request, "top_p", defaults["top_p"], float)
     top_k = utils.get_parameter(request, "top_k", defaults["top_k"], int)
     skip_refine = utils.get_parameter(request, "skip_refine", defaults["skip_refine"], int)
-    is_stream = utils.get_parameter(request, "is_stream", defaults["is_stream"], int)
     speed = utils.get_parameter(request, "speed", defaults["speed"], int)
     text_seed = utils.get_parameter(request, "text_seed", defaults["text_seed"], int)
     refine_max_new_token = utils.get_parameter(request, "refine_max_new_token", defaults["refine_max_new_token"], int)
@@ -264,7 +262,6 @@ def tts():
         wavs = chat.infer(
             te, 
             #use_decoder=False,
-            stream=True if is_stream==1 else False,
             skip_refine_text=skip_refine,
             do_text_normalization=False,
             do_homophone_replacement=True,
@@ -328,6 +325,135 @@ def tts():
         return jsonify(result_dict)
 
 
+
+@app.route('/tts_stream', methods=['GET', 'POST'])
+def tts_stream():
+    global audio_queue
+    # 原始字符串
+    text = request.args.get("text","").strip() or request.form.get("text","").strip()
+    prompt = request.args.get("prompt","").strip() or request.form.get("prompt",'')
+
+    # 默认值
+    defaults = {
+        "custom_voice": 0,
+        "voice": "2222",
+        "temperature": 0.3,
+        "top_p": 0.7,
+        "top_k": 20,
+        "skip_refine": 0,
+        "speed":5,
+        "text_seed":42,
+        "refine_max_new_token": 384,
+        "infer_max_new_token": 2048,
+        "wav": 0,
+        "is_stream":0
+    }
+
+    # 获取
+    custom_voice = utils.get_parameter(request, "custom_voice", defaults["custom_voice"], int)
+    voice = str(custom_voice) if custom_voice > 0 else utils.get_parameter(request, "voice", defaults["voice"], str)
+    temperature = utils.get_parameter(request, "temperature", defaults["temperature"], float)
+    top_p = utils.get_parameter(request, "top_p", defaults["top_p"], float)
+    top_k = utils.get_parameter(request, "top_k", defaults["top_k"], int)
+    skip_refine = utils.get_parameter(request, "skip_refine", defaults["skip_refine"], int)
+    is_stream = utils.get_parameter(request, "is_stream", defaults["is_stream"], int)
+    speed = utils.get_parameter(request, "speed", defaults["speed"], int)
+    text_seed = utils.get_parameter(request, "text_seed", defaults["text_seed"], int)
+    refine_max_new_token = utils.get_parameter(request, "refine_max_new_token", defaults["refine_max_new_token"], int)
+    infer_max_new_token = utils.get_parameter(request, "infer_max_new_token", defaults["infer_max_new_token"], int)
+    wav = utils.get_parameter(request, "wav", defaults["wav"], int)
+    
+    app.logger.info(f"[tts]{text=}\n{voice=},{skip_refine=}\n")
+    if not text:
+        return jsonify({"code": 1, "msg": "text params lost"})
+    # 固定音色
+    rand_spk=None
+    # voice可能是 {voice}.csv or {voice}.pt or number
+    voice=voice.replace('.csv','.pt')
+    seed_path=f'{SPEAKER_DIR}/{voice}'
+    print(f'{voice=}')
+    
+    if voice.endswith('.pt') and os.path.exists(seed_path):
+        #如果.env中未指定设备，则使用 ChatTTS相同算法找设备，否则使用指定设备
+        rand_spk=torch.load(seed_path, map_location=device)
+        print(f'当前使用音色 {seed_path=}')
+    
+    if rand_spk is None:    
+        print(f'当前使用音色：根据seed={voice}获取随机音色')
+        voice_int=re.findall(r'^(\d+)',voice)
+        if len(voice_int)>0:
+            voice=int(voice_int[0])
+        else:
+            voice=2222
+        torch.manual_seed(voice)
+        #std, mean = chat.sample_random_speaker
+        rand_spk = chat.sample_random_speaker()
+        #rand_spk = torch.randn(768) * std + mean
+        # 保存音色
+        torch.save(rand_spk,f"{SPEAKER_DIR}/{voice}.pt")
+        #utils.save_speaker(voice,rand_spk)
+
+    # 中英按语言分行
+    text_list=[t.strip() for t in text.split("\n") if t.strip()]
+    new_text=utils.split_text(text_list)
+    if text_seed>0:
+        torch.manual_seed(text_seed)
+    
+    params_infer_code = ChatTTS.Chat.InferCodeParams(
+        spk_emb=rand_spk,
+        prompt=f"[speed_{speed}]",
+        top_P=top_p,
+        top_K=top_k,
+        temperature=temperature,
+        max_new_token=infer_max_new_token
+    )
+    params_refine_text = ChatTTS.Chat.RefineTextParams(
+        prompt=prompt,
+        top_P=top_p,
+        top_K=top_k,
+        temperature=temperature,
+        max_new_token=refine_max_new_token
+    )
+    print(f'{prompt=}')
+    # 将少于30个字符的行同其他行拼接
+    retext=[]
+    short_text=""
+    for it in new_text:
+        if len(it)<30:
+            short_text+=f"{it} [uv_break] "
+            if len(short_text)>30:
+                retext.append(short_text)
+                short_text=""
+        else:
+            retext.append(short_text+it)
+            short_text=""
+    if len(short_text)>30 or len(retext)<1:
+        retext.append(short_text)
+    elif short_text:
+        retext[-1]+=f" [uv_break] {short_text}"
+        
+    new_text=retext
+    
+    new_text_list=[new_text[i:i+merge_size] for i in range(0,len(new_text),merge_size)]
+    def generate_audio():
+        for te in new_text_list:
+            wavs = chat.infer(
+                te,
+                stream=True,  # 启用流式处理
+                skip_refine_text=skip_refine,
+                do_text_normalization=False,
+                do_homophone_replacement=True,
+                params_refine_text=params_refine_text,
+                params_infer_code=params_infer_code
+            )
+            for wav_data in wavs:  # 假设 chat.infer 在流模式下会 yield 音频片段
+                # 将numpy数组转换为字节流
+                audio_tensor = torch.from_numpy(wav_data).unsqueeze(0)
+                buffer = io.BytesIO()
+                torchaudio.save(buffer, audio_tensor, 24000, format="wav")
+                buffer.seek(0)
+                yield buffer.read()
+    return Response(generate_audio(), mimetype='audio/x-wav')
 
 @app.route('/clear_wavs', methods=['POST'])
 def clear_wavs():
