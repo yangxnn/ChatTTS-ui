@@ -37,6 +37,7 @@ from uilib.cfg import WEB_ADDRESS, SPEAKER_DIR, LOGS_DIR, WAVS_DIR, MODEL_DIR, R
 from uilib import utils,VERSION
 from ChatTTS.utils import select_device
 from uilib.utils import is_chinese_os,modelscope_status
+import struct
 merge_size=int(os.getenv('merge_size',10))
 env_lang=os.getenv('lang','')
 if env_lang=='zh':
@@ -50,6 +51,61 @@ if not shutil.which("ffmpeg"):
     print('请先安装ffmpeg')
     time.sleep(60)
     exit()    
+
+
+def pcm_to_bytes(pcm_data, bits_per_sample=32):
+    if bits_per_sample == 16:
+        dtype = np.int16
+        fmt = '<h'  # Little-endian 16-bit signed integer
+    elif bits_per_sample == 24:
+        dtype = np.int32
+        fmt = '<i'  # Little-endian 32-bit signed integer, but only use 24 bits
+    elif bits_per_sample == 32:
+        dtype = np.int32
+        fmt = '<i'  # Little-endian 32-bit signed integer
+    else:
+        raise ValueError("Unsupported bits per sample: {}".format(bits_per_sample))
+
+    # 将浮点数转换为整数
+    if isinstance(pcm_data, np.ndarray):
+        pcm_data = (pcm_data * (2 ** (bits_per_sample - 1))).astype(dtype)
+    elif isinstance(pcm_data, (list, tuple)):
+        pcm_data = np.array(pcm_data).astype(np.float32)
+        pcm_data = (pcm_data * (2 ** (bits_per_sample - 1))).astype(dtype)
+    else:
+        raise TypeError("PCM data must be a numpy array, list, or tuple")
+
+    # Convert to bytes
+    byte_data = b''.join(struct.pack(fmt, sample) for sample in pcm_data)
+    return byte_data
+
+def create_wav_header(sample_rate, bits_per_sample, num_channels):
+    bytes_per_sample = bits_per_sample // 8
+    byte_rate = sample_rate * num_channels * bytes_per_sample
+    block_align = num_channels * bytes_per_sample
+
+    riff_chunk_size = 36 + (0 - 8)  # Initial size, will be updated later
+    format_chunk_size = 16  # Excluding the 'fmt ' header
+    format_tag = 1  # PCM
+    data_chunk_header = b'data'
+
+    header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                         b'RIFF', riff_chunk_size, b'WAVE', b'fmt ', format_chunk_size,
+                         format_tag, num_channels, sample_rate, byte_rate, block_align, bits_per_sample,
+                         data_chunk_header, 0)  # Data chunk size placeholder
+
+    # Print the header for debugging
+    # print(f"WAV Header: {header}")
+    # print(f"RIFF Chunk Size: {riff_chunk_size}")
+    # print(f"Format Chunk Size: {format_chunk_size}")
+    # print(f"Format Tag: {format_tag}")
+    # print(f"Num Channels: {num_channels}")
+    # print(f"Sample Rate: {sample_rate}")
+    # print(f"Byte Rate: {byte_rate}")
+    # print(f"Block Align: {block_align}")
+    # print(f"Bits Per Sample: {bits_per_sample}")
+
+    return header, riff_chunk_size
 
 
 chat = ChatTTS.Chat()
@@ -345,8 +401,7 @@ def tts_stream():
         "text_seed":42,
         "refine_max_new_token": 384,
         "infer_max_new_token": 2048,
-        "wav": 0,
-        "is_stream":0
+        "wav": 0
     }
 
     # 获取
@@ -356,7 +411,6 @@ def tts_stream():
     top_p = utils.get_parameter(request, "top_p", defaults["top_p"], float)
     top_k = utils.get_parameter(request, "top_k", defaults["top_k"], int)
     skip_refine = utils.get_parameter(request, "skip_refine", defaults["skip_refine"], int)
-    is_stream = utils.get_parameter(request, "is_stream", defaults["is_stream"], int)
     speed = utils.get_parameter(request, "speed", defaults["speed"], int)
     text_seed = utils.get_parameter(request, "text_seed", defaults["text_seed"], int)
     refine_max_new_token = utils.get_parameter(request, "refine_max_new_token", defaults["refine_max_new_token"], int)
@@ -435,25 +489,52 @@ def tts_stream():
     new_text=retext
     
     new_text_list=[new_text[i:i+merge_size] for i in range(0,len(new_text),merge_size)]
-    def generate_audio():
-        for te in new_text_list:
-            wavs = chat.infer(
-                te,
-                stream=True,  # 启用流式处理
-                skip_refine_text=skip_refine,
-                do_text_normalization=False,
-                do_homophone_replacement=True,
-                params_refine_text=params_refine_text,
-                params_infer_code=params_infer_code
-            )
-            for wav_data in wavs:  # 假设 chat.infer 在流模式下会 yield 音频片段
-                # 将numpy数组转换为字节流
-                audio_tensor = torch.from_numpy(wav_data).unsqueeze(0)
-                buffer = io.BytesIO()
-                torchaudio.save(buffer, audio_tensor, 24000, format="wav")
-                buffer.seek(0)
-                yield buffer.read()
-    return Response(generate_audio(), mimetype='audio/x-wav')
+
+    new_text = "".join(retext)
+
+    def generate_results(sample_rate, bits_per_sample, num_channels):
+        print(new_text)
+        results_generator = chat.infer(
+            text=new_text,
+            stream=True,
+            skip_refine_text=skip_refine,
+            do_text_normalization=False,
+            do_homophone_replacement=True,
+            params_refine_text=params_refine_text,
+            params_infer_code=params_infer_code
+        )
+
+        # Generate the WAV header
+        wav_header, riff_chunk_size = create_wav_header(sample_rate, bits_per_sample, num_channels)
+        # yield wav_header  # Send the WAV header first
+        initial_data_buffer = bytearray(wav_header)  # 初始化数据缓冲区包含 WAV 头部
+        initial_data_size = len(wav_header)
+
+        # initial_data_size = 0
+        # initial_data_buffer = bytearray()
+        for output in results_generator:
+            # print(f"Model Output Sample: {output[0][:20]}")  # 打印模型生成的前20个样本
+            pcm_data = pcm_to_bytes(output[0], bits_per_sample)  # Pass bits_per_sample here
+            initial_data_buffer.extend(pcm_data)
+            initial_data_size += len(pcm_data)
+            # 打印前几个样本
+            # print(f"PCM Data Sample: {pcm_data[:20]}")
+            # 如果初始数据缓冲区达到一定大小，发送它
+            if initial_data_size >= 10 * 1024:  # 10kb
+                yield initial_data_buffer
+                initial_data_buffer = bytearray()
+                initial_data_size = 0
+        # 发送剩余的初始数据
+        if initial_data_buffer:
+            yield initial_data_buffer
+            initial_data_size = len(initial_data_buffer)
+        # 更新WAV头中的数据大小
+        new_riff_chunk_size = riff_chunk_size + initial_data_size - 8
+        updated_riff_chunk = struct.pack('<4sI', b'RIFF', new_riff_chunk_size)
+        updated_data_chunk = struct.pack('<4sI', b'data', initial_data_size)
+        updated_header = updated_riff_chunk + wav_header[8:24] + updated_data_chunk
+        yield updated_header  # Resend the updated header
+    return Response(generate_results(sample_rate=24000, bits_per_sample=32, num_channels=1), mimetype='audio/x-wav')
 
 @app.route('/clear_wavs', methods=['POST'])
 def clear_wavs():
@@ -471,4 +552,5 @@ try:
     serve(app,host=host[0], port=int(host[1]))
 except Exception as e:
     print(e)
+
 
